@@ -1,0 +1,325 @@
+import pygame
+import pygame_gui
+import io
+import json
+import os
+import queue
+import re
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from urllib.parse import urlparse
+
+
+import requests
+from bs4 import BeautifulSoup
+from keyboard import Keyboard
+
+BAR_POS = (25, 450)
+BAR_SIZE = (590, 20)
+BORDER_COLOR = (100, 100, 100)
+BAR_COLOR = (0, 255, 0)
+
+ROM_ROOT_PATH = "/userdata/roms/"
+
+CONSOLES = ["GB", "GBA", "GBC", "N64", "NES", "SNES", "DS", "Dreamcast", "PSP", "PS1"]
+
+SPECIAL_MAPPINGS = {"DS": "nds", "PS1": "psx"}
+
+SUPPORTED_CONSOLES = {
+    console: f"{ROM_ROOT_PATH}{SPECIAL_MAPPINGS.get(console, console.lower())}"
+    for console in CONSOLES
+}
+
+
+class SearchApp:
+    def __init__(self):
+        pygame.init()
+        self.screen = pygame.display.set_mode((640, 480))
+        pygame.display.set_caption("Download Roms")
+        self.background_color = (42, 42, 42)
+        self.session = requests.Session()
+        self.gui_manager = pygame_gui.UIManager((640, 480), "theme.json")
+        self.download_in_progress = False
+        self.highlight_area = "main"  # "main" or "keyboard"
+        self.progress_queue = queue.Queue()
+        self.setup_ui()
+
+    def setup_ui(self):
+        self.screen.fill(self.background_color)
+        self.results_list = pygame_gui.elements.UISelectionList(
+            relative_rect=pygame.Rect((25, 120), (590, 330)),
+            item_list=[],
+            manager=self.gui_manager,
+        )
+        self.search_input = pygame_gui.elements.UITextEntryLine(
+            relative_rect=pygame.Rect((25, 50), (425, 50)), manager=self.gui_manager
+        )
+        self.search_button = pygame_gui.elements.UIButton(
+            relative_rect=pygame.Rect((465, 50), (150, 50)),
+            text="Search",
+            manager=self.gui_manager,
+        )
+        self.search_input.blink_cursor_time = 480
+        self.button_list_main = [
+            self.search_input,
+            self.search_button,
+            *self.results_list.item_list_container.elements,
+        ]
+        self.button_index_main = 0
+        self.active_button_main = self.button_list_main[self.button_index_main]
+
+        # Keyboard
+        self.keyboard = Keyboard(self.gui_manager, self.search_input)
+        self.button_list_keyboard = [*self.keyboard.panel.panel_container.elements]
+        self.button_index_keyboard = 0
+        self.active_button_keyboard = self.button_list_keyboard[
+            self.button_index_keyboard
+        ]
+
+    def fetch_url(self, url):
+        response = self.session.get(url)
+        response.raise_for_status()
+        return response.content
+
+    def parse_page(self, content):
+        soup = BeautifulSoup(content, "html.parser")
+        parsed_rows = []
+
+        for row in soup.find("table").find_all("tr")[1:]:
+            columns = row.find_all("td")
+            console = columns[0].text.strip()
+
+            if console not in SUPPORTED_CONSOLES.keys():
+                continue
+
+            game_link = columns[1].find("a", href=True)
+            if game_link:
+                region_img = columns[2].find("img")
+                region = region_img["title"] if region_img else "Unknown"
+                game_info = {
+                    "id": game_link["href"].split("/")[-1],
+                    "name": game_link.text.strip(),
+                    "console": console,
+                    "region": region,
+                }
+                parsed_rows.append(game_info)
+
+        return parsed_rows
+
+    def handle_search(self):
+        search_query = self.search_input.get_text()
+        initial_url = f"https://vimm.net/vault/?p=list&q={search_query}"
+        initial_content = self.fetch_url(initial_url)
+        matching_files = self.parse_page(initial_content)
+
+        soup = BeautifulSoup(initial_content, "html.parser")
+        total_pages = self.get_total_pages(soup)
+        urls = [f"{initial_url}&page={page}" for page in range(2, total_pages + 1)]
+
+        with ThreadPoolExecutor(max_workers=5) as executor:
+            futures = [executor.submit(self.fetch_url, url) for url in urls]
+            for future in as_completed(futures):
+                content = future.result()
+                matching_files.extend(self.parse_page(content))
+
+        matching_files = list(
+            {json.dumps(file): file for file in matching_files}.values()
+        )
+
+        self.results_list.set_item_list([json.dumps(file) for file in matching_files])
+
+    def get_total_pages(self, soup):
+        pagination = soup.find("div", {"class": "pagination"})
+        pages = pagination.find_all("a") if pagination else []
+        total_pages = max([int(page.get_text()) for page in pages] + [1])
+        return total_pages
+
+    def download_rom(self, rom):
+        if self.download_in_progress:
+            print("Download in progress")
+            return
+        self.download_in_progress = True
+        threading.Thread(target=self._download_rom_thread, args=(rom,)).start()
+
+    def _download_rom_thread(self, rom):
+        payload = json.loads(rom)
+        url = f"https://vimm.net/vault/{payload['id']}"
+        content = self.fetch_url(url)
+        soup = BeautifulSoup(content, "html.parser")
+        media_id_element = soup.find("input", {"name": "mediaId"})
+        media_id = (
+            media_id_element["value"] if media_id_element else "Media ID not found"
+        )
+        print(media_id)
+        download_url = f"https://download3.vimm.net/download/?mediaId={media_id}"
+        headers = {
+            "Referer": url,
+            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+        }
+        response = self.session.get(download_url, headers=headers, stream=True)
+        if response.ok:
+            filename = self.extract_filename(response)
+            self.save_file(response, filename)
+        else:
+            print(f"Failed to download ROM. Status code: {response.status_code}")
+        self.download_in_progress = False
+
+    def extract_filename(self, response):
+        content_disposition = response.headers.get("content-disposition", "")
+        filename = re.findall('filename="(.+)"', content_disposition)
+        return (
+            filename[0] if filename else os.path.basename(urlparse(response.url).path)
+        )
+
+    def save_file(self, response, filename):
+        total_size = int(response.headers.get("content-length", 0))
+        downloaded = 0
+        with open(filename, "wb") as f:
+            last_progress = 0
+            for chunk in response.iter_content(chunk_size=4096):
+                downloaded += len(chunk)
+                f.write(chunk)
+                progress = downloaded / total_size
+                if (
+                    progress - last_progress >= 0.001
+                ):  # Update the progress bar for every 1% progress
+                    last_progress = progress
+                    self.progress_queue.put(progress)
+
+    def update_progress_bar_ui(self, progress):
+        print(progress)
+        self.update_progress_bar(BAR_POS, BAR_SIZE, BAR_COLOR, progress)
+        text = pygame.font.SysFont("Oswald", 15).render(
+            f"{int(progress * 100)}%", True, (0, 0, 0)
+        )
+        text_rect = text.get_rect()
+        text_pos = (
+            BAR_POS[0] + (BAR_SIZE[0] - text_rect.width) // 2,
+            BAR_POS[1] + (BAR_SIZE[1] - text_rect.height) // 2,
+        )
+        self.screen.blit(text, text_pos)
+        pygame.display.update(pygame.Rect(*BAR_POS, *BAR_SIZE))
+
+    def update_progress_bar(self, pos, size, color, progress):
+        innerPos = (pos[0] + 3, pos[1] + 3)
+        innerSize = ((size[0] - 6) * progress, size[1] - 6)
+        pygame.draw.rect(self.screen, color, (*innerPos, *innerSize))
+
+    def close_keyboard(self):
+        self.highlight_area = "main"
+        self.keyboard.close_panel()
+
+    def open_keyboard(self):
+        self.highlight_area = "keyboard"
+        self.keyboard.open_panel()
+
+    def handleSpaceButtonEvents(self, button_pressed):
+        if self.highlight_area == "main":
+            if button_pressed == self.search_button:
+                self.close_keyboard()
+                self.handle_search()
+            elif button_pressed == self.search_input:
+                self.open_keyboard()
+
+    def handle_user_event(self, event):
+        if event.user_type == pygame_gui.UI_BUTTON_PRESSED:
+            button_text = event.ui_element.text
+            print(f"Button was pressed: {button_text}")
+
+            if button_text == "Close" or event.ui_element == self.search_button:
+                self.close_keyboard()
+                if button_text != "Close":
+                    self.handle_search()
+            elif button_text == "Space":
+                self.search_input.set_text(self.search_input.text + " ")
+            elif button_text == "Bksp":
+                self.search_input.set_text(self.search_input.text[:-1])
+            else:
+                if self.highlight_area == "keyboard":
+                    # TODO: Fix this
+                    self.keyboard.close_panel()
+                self.download_rom(button_text)
+
+    def handle_keydown_event(self, event):
+        pygame.key.set_repeat()
+        if event.key == pygame.K_RETURN:
+            self.handle_search()
+        elif event.key in [pygame.K_LEFT, pygame.K_RIGHT, pygame.K_UP, pygame.K_DOWN]:
+            self.handle_arrow_keys(event.key)
+        elif event.key == pygame.K_SPACE:
+            print(f"Button was pressed ACTIVATE.", self.active_button_main.text)
+            self.handleSpaceButtonEvents(self.active_button_main)
+
+    def handle_arrow_keys(self, key):
+        if key == pygame.K_LEFT:
+            self.move_selection(-1)
+        elif key == pygame.K_RIGHT:
+            self.move_selection(1)
+        elif key == pygame.K_UP:
+            self.move_selection(-10)
+        elif key == pygame.K_DOWN:
+            self.move_selection(10)
+
+    def move_selection(self, step):
+        if self.highlight_area == "main":
+            self.button_index_main = max(
+                0, min(self.button_index_main + step, len(self.button_list_main) - 1)
+            )
+            self.active_button_main = self.button_list_main[self.button_index_main]
+        else:
+            self.button_index_keyboard = max(
+                0,
+                min(
+                    self.button_index_keyboard + step,
+                    len(self.button_list_keyboard) - 1,
+                ),
+            )
+            self.active_button_keyboard = self.button_list_keyboard[
+                self.button_index_keyboard
+            ]
+
+    def draw_highlight(self):
+        if self.highlight_area == "main":
+            pygame.draw.rect(
+                self.screen, (24, 109, 245), self.active_button_main.rect, 2, 4
+            )
+        else:
+            pygame.draw.rect(
+                self.screen, (24, 109, 245), self.active_button_keyboard.rect, 2, 4
+            )
+
+    def run(self):
+        clock = pygame.time.Clock()
+        running = True
+
+        while running:
+            time_delta = clock.tick(60) / 1000.0
+            for event in pygame.event.get():
+                if event.type == pygame.QUIT:
+                    running = False
+
+                elif event.type == pygame.USEREVENT:
+                    self.handle_user_event(event)
+
+                elif event.type == pygame.KEYDOWN:
+                    self.handle_keydown_event(event)
+
+                self.gui_manager.process_events(event)
+
+            self.gui_manager.update(time_delta)
+            self.screen.fill(self.background_color)
+            self.gui_manager.draw_ui(self.screen)
+
+            pygame.display.update()
+            try:
+                while True:
+                    progress = self.progress_queue.get_nowait()
+                    self.update_progress_bar_ui(progress)
+            except queue.Empty:
+                pass
+        pygame.quit()
+
+
+if __name__ == "__main__":
+    app = SearchApp()
+    app.run()
